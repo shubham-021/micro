@@ -108,7 +108,7 @@ interface CachedEntry {
 
 // Options for get or set (read-through)
 export interface ReadThroughOptions {
-    ttlSecond?: number;
+    ttlSeconds?: number;
     staleTtlSeconds?: number;
     skipL1?: boolean;
     skipL2?: boolean;
@@ -274,13 +274,13 @@ export class CacheService {
         const staleTtl = opts?.staleTtlSeconds ?? this.defaultStaleTtl;
         const totalTtl = ttl + staleTtl;
 
-        const enrty: CachedEntry = {
+        const entry: CachedEntry = {
             d: value,
             f: Date.now() + ttl * 1000
         };
 
         this.l1.set(key, value, ttl);
-        return this.l2Set(key, enrty, totalTtl);
+        return this.l2Set(key, entry, totalTtl);
     }
 
     /* Core: delete */
@@ -333,7 +333,7 @@ export class CacheService {
     */
 
     async getOrSet<T>(key: string, loader: () => Promise<T>, opts?: ReadThroughOptions): Promise<Result<T, CacheError>> {
-        const ttl = opts?.ttlSecond ?? this.defaultTtl;
+        const ttl = opts?.ttlSeconds ?? this.defaultTtl;
         const staleTtl = opts?.staleTtlSeconds ?? this.defaultStaleTtl;
 
         // L1
@@ -407,5 +407,397 @@ export class CacheService {
         }).finally(() => {
             this.inFlight.delete(key);
         })
+    }
+
+    /*  Write-Through 
+    *
+    *   Whenever your application writes data, the write goes to the cache, and the cache synchronously writes the data to the database before 
+    *   considering the operation complete.
+    * 
+    *   Client -> Application Server -> Cache -> Database
+    * 
+    *   Comparing it with cache-aside:
+    *   Cache-Aside: The application is responsible for both cache and DB, server -> DB, server -> Cache, the application has to coordinate the two
+    *   Write-through: The cache becomes the part of the write path, the cache handles the DB write.
+    * 
+    *   Advantages:
+    *       1. Reduces stale data in the cache
+    *           Since the cache is updated as part of every write, it is less likely to contain an old version of the data
+    *       2. Fast subsequent reads
+    *           After a successful write, the updated data is already present in the cache, therefore, a later read can be served without accessing the database
+    *       3. Simpler application logic
+    *           The application does not have to separately perform: 1. Database update 2. Cache update
+    *       4. Good read performance
+    *           It works particularly well when the same data is written occasinally but read many times. The cache remain populated with the lates written value.
+    *       5. Better consistency between cache and database
+    *           Compared with approaches where the cache is updated asynchronously, write-through provides a stronger guarantee that a successful write has also been
+    *           persisted to the database
+    * 
+    *   Disadvantages:
+    *       1.Higher write latency
+    *           The application must wait for the database write before completing the request.
+    *       2. Does not reduce database write load
+    *           Write-through does not reduce database write load because every write is synchronously propagated to the database (Not a problem, rather a simple tradeoff)
+    *       3. Not ideal for write-heavy system
+    *           If an application performs a very large number of write and relatively few reads, mainting the cache on every write may provide little benefit
+    *       4. Cache and Database can still become inconsistent
+    *           Write-through reduces one source of inconsistency, but it does not completely solve distributed-system problem. Failures, concurrent writes, direct
+    *           database modifications, or multiple caching layers can still create inconsistencies
+    *       5. More dependency on the cache during writes
+    *           Because the cache is part of the write path, problem s in the caching layer can affect write operation depending on the implementation.
+    * 
+    * 
+    *   When to use ?
+    *       - The data is read much more frequently than it is written
+    *       - The data should be available in the cache immediately after a write
+    *       - Stale data is undesirable
+    *       - The application can tolerate the additional write latency
+    *       - Database writes do not need to be heavily optimized or batched
+    *       - The same data is likely to be read soon after being written
+    * 
+    *   When to avoid ?
+    *       - The system is extremely write-heavy
+    *       - Very low write latency is more important than immediate database presistence
+    *       - The database cannot handle the write volume efficiently
+    *       - Writes can safely be processed asynchronously
+    *       - The system benefits from batching multiple writes together
+    *       - The cached data is rarely read, so maintaing it on every write provides a little benefit
+    * 
+    * 
+    *   What does it mean reducing Database write load ?
+    *       Write-back caching can reduce the immediate datbase workload, not necessarily the total amount of data the must eventually be persisted. It can temporarily
+    *       store updates in the cache and later write them to the db in batches or combine multiple updates when the intermediate states are not important.
+    * 
+    *       For example, if a value changes from 100 -> 101 -> 102 -> 103 and only the final value matters, a write-back system may persist only 103 instead of performing
+    *       four separate database writes.
+    * 
+    * 
+    *   How does batching operations reduces DB costs ?
+    *       A write can involve:
+    *           1. Network Overhead: The application has to communicate with the database
+    *           2. Query parsing/ plannig: The database may need to parse and plan each statement
+    *           3. Transaction overhead: Starting/ committing transactions has a cost
+    *           4. WAL/ redo logging: Databases such as PSQL write changes to a write-ahead log for durability
+    *           5. Disk I/O / fsync: Durable commits may require flushing data/ logs to storage
+    *           6. Index Updates: If you update a row, relevant indexes may also need to be updated
+    *           7. Locking and concurrency management: The database has to coordinate concurrent transactions
+    *           8. Buffer/ cache management: Pages may need to be loaded, modified, and eventually flushed
+    * 
+    *   So,
+    *   One DB operation: Network -> Parse/ plan -> Transaction -> Modify data -> Update indexes -> Write WAL -> Commit/ Sync
+    *   
+    *   Now if you do multiple writes one by one, you might perform:
+    *       INSERT 1 -> transaction -> commit
+    *       INSERT 2 -> transaction -> commit
+    *       ....
+    *       INSERT 1000 -> transaction -> commit
+    * 
+    *   You are paying the txn/ commit overhead 1000 times
+    * 
+    *   With batching, you can do:
+    *       BEGIN
+    *       INSERT 1
+    *       INSERT 2
+    *       ....
+    *       INSERT 1000
+    *       COMMIT
+    * 
+    *   Now you still write 1000 records, but you may perform the txn/commit work only once
+    * 
+    * 
+    *   Think of the cost as: Total DB cost = per-operation overhead + cost of processing the actual data
+    * 
+    *   There's another optimization: Sometimes batching can reduce the amount of actual db work, not just overhead
+    *   for example:
+    *       UPDATE counter
+    *       SET value = value + 1
+    *   
+    *   performed 1000 times, if the application only cares about the final counter, you could accumulate: 1000 increments and perform:
+    *       UPDATE counter
+    *       SET value = value + 1000
+    */
+
+    async writeThrough<T>(key: string, value: T, writer: () => Promise<void>, opts?: WriteOptions): Promise<Result<void, CacheError>> {
+        try {
+            await writer();
+        } catch (err) {
+            return Err(createCacheError("CACHE_WRITE_FAILED", "source write failed", err));
+        }
+
+        const cacheResult = await this.set(key, value, opts);
+        if (!cacheResult.ok) {
+            console.error(`cache write-through update failed for ${key}`);
+        }
+
+        return Ok(undefined);
+    }
+
+    /*  Write-Behind (Write-Back) 
+    *
+    *   It is a technique where a write is first made to the cache, and the database is updated asynchronously at a later time.
+    *   
+    *   When the application receives a write:
+    *       1. The application writes the new value to the cache
+    *       2. The cache immediately acknowledges the write
+    *       3. The application can return the response to the client
+    *       4. The cache later writes the change to the database.
+    *       5.  Multiple changes may be combined or written in batches
+    *   
+    *   So the database is not immediately updated when the client receives a successful response
+    *   
+    *   Advantages:
+    *       - Lower write latency
+    *       - Can reduce immediate database workload
+    *       - Can handle high write traffic
+    *       - Can combine redundant updates
+    * 
+    *   Disadvantages:
+    *       - Risk of data loss
+    *       - DB can temporarily contain stale data
+    *       - More complex failure handling
+    *       - More memory/ storage requirements
+    * 
+    *   When to use ?
+    *       - Very low write latency is important
+    *       - The system receives a large volume of writes
+    *       - The database can tolerate delayed writes
+    *       - Writes can be batched or combined
+    *       - Temporary inconsistency between cache and database is acceptable
+    *       - Losing a write can be prevented through a reliable presistence mechanism
+    * 
+    *   When to avoid ?
+    *       - Every write must be immediately persisted
+    *       - Losing even one write is unacceptable
+    *       - The database must always contain the latest state.
+    *       - Strong consistency is required
+    *       - The system cannot tolerate complex recovery logic
+    * 
+    *   For asychronous database updates with reliable recovery, we usually use a durable message queue/ event log between the application and the db
+    *   The common pattern is:
+    *       Application -> Cache -> Durable Queue/ Log -> Worker -> DB
+    * 
+    *   Why a queue ?
+    *       The queue stores the pending write until a worker successfully writes it to the database.
+    * 
+    *   If DB is temporarily unavailable ?
+    *       Queue -> Worker -> DB (fails) -> retry later
+    * 
+    *   The write remains in the queue, so it isnt lost simply because the db was unavailable
+    * 
+    *   Recovery Mechanisms:
+    *       A reliable implementation generally uses:
+    *       - Durable queue/ log - Keeps pending writes safe
+    *       - Acknowledgements - remove/ mark a message processed only after successful DB persistence
+    *       - Retries - retry failed database writes
+    *       - Dead-letter queue (DLQ) - move repeatedly failing messages aside for investigatio/ reprocessing
+    *       - Idempotancey - ensure retrying the same write doesn't create duplicate effects
+    *       - Ordering/ versioning - important when multiple updates to the same record must be applied in order
+    */
+
+    async writeBehind<T>(key: string, value: T, writer: () => Promise<void>, opts?: WriteOptions): Promise<Result<void, CacheError>> {
+        const cacheResult = await this.set(key, value, opts);
+        writer().catch((err) => {
+            console.error(`cache write-behind flush failed for ${key}: `, err);
+        })
+
+        // queue implementation (to-be done)
+
+        return cacheResult;
+    }
+
+    /*  Write-Around 
+    *
+    *   Caching technique where write operations go directly to the database and do not update the cache
+    *   
+    *   Write: Application -> Database
+    *   Read: Application -> Cache -> miss -> Database -> Cache
+    * 
+    *   "Write bypass the cache. The cache is populated only when the data is sunsequently read"
+    * 
+    *   Advantages:
+    *       - Prevents cache pollution
+    *       - Reduces unnecessary cache writes
+    *       - Good for write-heavy workloads
+    *       - Simple Write path
+    * 
+    *   Disadvantes:
+    *       - First read after a write is a cache miss
+    *       - Database can temporarily be newer than the cache
+    * 
+    *   When to use ?
+    *       - Data is written frequently but read infrequently
+    *       - You dont want every write to populate the cache
+    *       - Cache space is limited
+    *       - You want to avoid cache pollution
+    *       - A cache miss on the first read after a write is acceptable
+    *       - The database is the source of truth
+    * 
+    *   Bypassing cache, can leave cache with outdated data, thats why write-around requires cache invalidation
+    *   The write operation is typically: Application -> (DB <- update) -> invalidate cache
+    */
+
+    async writeAround(key: string, writer: () => Promise<void>): Promise<Result<void, CacheError>> {
+        try {
+            await writer();
+        } catch (err) {
+            return Err(createCacheError("CACHE_WRITE_FAILED", "source write failed", err));
+        }
+
+        return this.delete(key);
+    }
+
+    /*  Refresh-Ahead 
+    *   
+    *   Caching technique in which the system refreshes a cache entry before it expires, rather than waiting for the entry to expire and cause a cache miss
+    *   The main goal is:
+    *       "Keep frequently accessed data in the cache so that users rarely experience a cache miss"
+    * 
+    *   Advantages:
+    *       - Reduces cache-miss latency    
+    *       - Good for frequently accessed data
+    *       - Protects the db from sudden read spikes
+    *       - Provides predictable read performance
+    * 
+    *   Disadvantages:
+    *       - Unnecessary database work
+    *       - More complexity
+    *       - Can increase db load
+    * 
+    *   When to use it ?
+    *       - Data is very frequently accessed
+    *       - A cache miss would be expensive or slow
+    *       - The data changes relatively infrequently
+    *       - You can tolerate slightly stale data during refresh
+    *       - The cost of refreshing is lower than the cost of allowing frequent cache misses
+    * 
+    *   When to avoid ?
+    *       - The data is rarely accessed
+    *       - DB queries are expensive and unnecessary refreshes are costly
+    *       - The data changes very frequently
+    *       - It is acceptable for the first request after expiration to experience a cache miss
+    *       - You have too many cache entries to refresh efficiently
+    */
+
+    async getWithRefreshAhead<T>(key: string, loader: () => Promise<T>, opts?: ReadThroughOptions & { refreshThreshold?: number }): Promise<Result<T, CacheError>> {
+        const ttl = opts?.ttlSeconds ?? this.defaultTtl;
+        const staleTtl = opts?.staleTtlSeconds ?? this.defaultStaleTtl;
+        const threshold = opts?.refreshThreshold ?? 0.2;
+
+        // L1
+        const l1Hit = this.l1.get<T>(key);
+        if (l1Hit !== undefined) return Ok(l1Hit);
+
+        // L2
+        const l2Result = await this.l2Get(key);
+        if (l2Result.ok && l2Result.value !== null) {
+            const entry = l2Result.value;
+            const data = entry.d as T;
+            const now = Date.now();
+            const ttlMs = ttl * 1000;
+            const freshUntil = entry.f;
+
+            const remaining = freshUntil - now;
+
+            this.l1.set(key, data, ttl);
+
+            if (remaining > 0 && remaining < ttlMs * threshold) {
+                this.backgroundRefresh(key, loader, ttl, staleTtl);
+            }
+
+            if (now < freshUntil) {
+                return Ok(data);
+            }
+
+            this.backgroundRefresh(key, loader, ttl, staleTtl);
+            return Ok(data);
+        }
+
+        return this.loadWithSingleFlight<T>(key, loader, ttl, staleTtl);
+    }
+
+    /* Bulk: getMany */
+
+    async getMany<T>(keys: string[]): Promise<Result<Map<string, T | null>, CacheError>> {
+        const results = new Map<string, T | null>();
+        const l2Keys: string[] = [];
+        const l2KeysIndexMap: string[] = [];
+
+        for (const key of keys) {
+            const l1Hit = this.l1.get<T>(key);
+            if (l1Hit !== undefined) {
+                results.set(key, l1Hit);
+            } else {
+                l2Keys.push(this.fullKey(key));
+                l2KeysIndexMap.push(key);
+            }
+        }
+
+        if (l2Keys.length === 0) return Ok(results);
+
+        try {
+            const rawValues = await this.redis.mget(...l2Keys);
+
+            for (let i = 0; i < rawValues.length; i++) {
+                const originalKey = l2KeysIndexMap[i];
+                const raw = rawValues[i];
+
+                if (raw === null) {
+                    results.set(originalKey, null);
+                    continue;
+                }
+
+                try {
+                    const entry: CachedEntry = JSON.parse(raw);
+                    const data = entry.d as T;
+                    results.set(originalKey, data);
+                    this.l1.set(originalKey, data);
+                } catch {
+                    results.set(originalKey, null);
+                }
+            }
+
+            return Ok(results);
+        } catch (err) {
+            return Err(createCacheError("CACHE_UNAVAILABLE", "mget failed", err));
+        }
+    }
+
+    /* Cache Warming */
+
+    async warm(entries: Array<{ key: string; loader: () => Promise<unknown>; ttlSeconds?: number }>, concurrency: number = 5): Promise<{ succeeded: number; failed: number }> {
+        let succeeded = 0;
+        let failed = 0;
+
+        for (let i = 0; i < entries.length; i += concurrency) {
+            const batch = entries.slice(i, i + concurrency);
+            const results = await Promise.allSettled(
+                batch.map(async (entry) => {
+                    const value = await entry.loader();
+                    await this.set(entry.key, value, { ttlSeconds: entry.ttlSeconds });
+                })
+            );
+
+            for (const result of results) {
+                if (result.status === "fulfilled") succeeded++;
+                else failed++;
+            }
+        }
+
+        console.log(`cache warming complete: ${succeeded} succeeded, ${failed} failed`);
+        return { succeeded, failed };
+    }
+
+    /* Lifecycle */
+
+    async destroy(): Promise<void> {
+        this.l1.destroy();
+        this.inFlight.clear();
+
+        try {
+            await this.subRedis.unsubscribe(INVALIDATION_CHANNEL);
+            await this.subRedis.quit();
+        } catch {
+
+        }
     }
 }
