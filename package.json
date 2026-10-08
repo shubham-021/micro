@@ -14,7 +14,9 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "argon2": "^0.45.1",
     "ioredis": "^6.0.0",
+    "jose": "^6.2.12",
     "zod": "^4.6.5"
   }
 }
